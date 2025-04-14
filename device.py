@@ -459,9 +459,7 @@ def send_heartbeat(sock):
     print("[DEBUG] Heartbeat thread iniciada.")
     while not shutdown_flag.is_set():
         try:
-            print(f"[DEBUG] Tentando enviar HEARTBEAT: {heartbeat_message.decode()}")
             sock.sendto(heartbeat_message, (BROADCAST_ADDR, DEFAULT_PORT))
-            print(f"[DEBUG] HEARTBEAT enviado para {(BROADCAST_ADDR, DEFAULT_PORT)}")
         except socket.error as e:
              print(f"[Erro] Falha ao enviar HEARTBEAT: {e}", file=sys.stderr)
         except Exception as e:
@@ -651,7 +649,7 @@ def send_file(sock, target_name, filepath):
         print(f"[Erro] Falha ao obter informações do arquivo {filepath}: {e}", file=sys.stderr)
         return
 
-    transfer_id = str(uuid.uuid4()) # ID único para toda a transferência
+    transfer_id = str(uuid.uuid4())
     total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE if file_size > 0 else 1
 
     # Registrar estado da transferência
@@ -664,7 +662,7 @@ def send_file(sock, target_name, filepath):
             'total_chunks': total_chunks,
             'next_seq': 0,
             'file_hash': file_hash,
-            'ack_received': threading.Event() # Evento para sinalizar ACK do FILE/END/NACK
+            'ack_received': threading.Event()
         }
 
     # Criar e enviar mensagem FILE
@@ -672,11 +670,8 @@ def send_file(sock, target_name, filepath):
     print(f"[Transferência {transfer_id}] Iniciando envio de '{filename}' ({file_size} bytes) para {target_name}...")
     send_udp_message(sock, file_message, target_addr, needs_ack=True, msg_id=transfer_id, callback=file_transfer_callback)
 
-    # A continuação (envio de CHUNKs) acontecerá no callback se o ACK do FILE for recebido.
-
 def file_transfer_callback(msg_id, success, reason):
     """Callback para ACKs/NACKs/Timeouts de mensagens FILE, END e CHUNKs."""
-    # Determinar se é um ACK/NACK para FILE, END ou CHUNK
     is_chunk_ack = '-' in msg_id # IDs de ACK de chunk são "transfer_id-seq"
 
     if is_chunk_ack:
@@ -692,11 +687,11 @@ def file_transfer_callback(msg_id, success, reason):
              transfer_info = ongoing_sends.get(transfer_id)
              if not transfer_info:
                  # Transferência pode ter sido cancelada/concluída
-                 # print(f"DEBUG: ACK de CHUNK {seq} para transferência {transfer_id} não encontrada.")
+                 print(f"DEBUG: ACK de CHUNK {seq} para transferência {transfer_id} não encontrada.")
                  return
 
              if success:
-                 # print(f"DEBUG: ACK recebido para CHUNK {seq} da transferência {transfer_id}")
+                 print(f"DEBUG: ACK recebido para CHUNK {seq} da transferência {transfer_id}")
                  # Verificar se este ACK permite enviar o próximo chunk
                  # A lógica de enviar o próximo chunk é melhor gerenciada após o envio inicial do FILE
                  # e continuada aqui.
@@ -706,9 +701,8 @@ def file_transfer_callback(msg_id, success, reason):
                           send_next_chunk(transfer_id, transfer_info)
                      else:
                           # Todos os chunks enviados e último ACK recebido, enviar END
-                          if not transfer_info.get('end_sent', False): # Evitar enviar END múltiplas vezes
+                          if not transfer_info.get('end_sent', False):
                               send_end_message(transfer_id, transfer_info)
-                 # else: ACK de chunk antigo ou fora de ordem, ignorar para controle de fluxo
              else:
                  # Falha ao receber ACK do CHUNK (timeout ou NACK implícito)
                  print(f"\n[Erro] Falha ao confirmar CHUNK {seq} para transferência {transfer_id}: {reason}", file=sys.stderr)
@@ -869,9 +863,7 @@ def main():
         send_udp_message(sock, initial_heartbeat, (BROADCAST_ADDR, port))
 
         # Manter a thread principal viva esperando pelas outras (ou pelo shutdown)
-        # cli_thread.join() # Espera a CLI terminar (com quit, Ctrl+C ou Ctrl+D)
-
-        # Alternativamente, esperar pelo evento de shutdown'
+        cli_thread.join() # Espera a CLI terminar (com quit, Ctrl+C ou Ctrl+D)
         shutdown_flag.wait()
 
 
