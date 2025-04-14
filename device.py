@@ -13,9 +13,9 @@ DEFAULT_PORT = 55555
 BROADCAST_ADDR = "255.255.255.255" # Ou o endereço de broadcast específico da rede
 HEARTBEAT_INTERVAL = 5  # Segundos
 DEVICE_TIMEOUT = 15     # Segundos (maior que 2 * HEARTBEAT_INTERVAL)
-ACK_TIMEOUT = 2         # Segundos para esperar por um ACK
+ACK_TIMEOUT = 5         # Segundos para esperar por um ACK
 MAX_RETRIES = 3         # Máximo de retransmissões
-CHUNK_SIZE = 1024       # Tamanho do bloco de dados para CHUNK (bytes antes do base64)
+CHUNK_SIZE = 512       # Tamanho do bloco de dados para CHUNK (bytes antes do base64)
 MAX_MESSAGE_SIZE = 65507 # Tamanho máximo teórico do payload UDP
 
 # --- Estruturas de Dados Globais (Protegidas por Locks) ---
@@ -96,7 +96,7 @@ def send_udp_message(sock, message_bytes, addr, needs_ack=False, msg_id=None, ca
                     'message': message_bytes,
                     'timestamp': time.time(),
                     'retries': 0,
-                    'callback': callback # Função a ser chamada em caso de sucesso (ACK) ou falha
+                    'callback': callback
                 }
     except socket.error as e:
         print(f"[Erro] Falha ao enviar mensagem para {addr}: {e}", file=sys.stderr)
@@ -121,13 +121,7 @@ def handle_incoming_messages(sock):
             ready, _, _ = select.select([sock], [], [], 0.5) # Timeout de 0.5s
             if ready:
                 data, addr = sock.recvfrom(MAX_MESSAGE_SIZE)
-                # print(f"DEBUG: Recebido {data[:60]}... de {addr}") # Debug
-
-                # Ignorar mensagens de si mesmo (alguns sistemas operacionais retornam broadcasts)
-                # Obter o IP local pode ser complexo, uma simplificação é checar a porta se for a mesma
-                # Mas a melhor forma é comparar o nome após o HEARTBEAT inicial
-                # Por agora, vamos processar e deixar o handler do HEARTBEAT filtrar
-                # if addr[0] == my_ip and addr[1] == DEFAULT_PORT: continue
+                # print(f"DEBUG: Recebido {data[:60]}... de {addr}")
 
                 command, args, sender_addr = parse_message(data, addr)
                 if not command:
@@ -200,8 +194,6 @@ def handle_heartbeat(sender_name, sender_addr):
             'port': sender_addr[1],
             'last_heartbeat': now
         }
-        # Limpar dispositivos inativos (melhor fazer em thread separada, mas ok aqui por simplicidade)
-        # check_inactive_devices_internal(now) # Chama a lógica interna sem lock
 
 def handle_talk(msg_id, content, sender_addr, sock):
     """Processa uma mensagem TALK e envia ACK."""
@@ -218,7 +210,6 @@ def handle_talk(msg_id, content, sender_addr, sock):
     # Enviar ACK
     ack_msg = create_message("ACK", msg_id)
     send_udp_message(sock, ack_msg, sender_addr)
-    print(f"DEBUG: handle_talk em [{DEVICE_NAME}] processando msg_id={msg_id} de {sender_addr} com conteúdo '{content}'") # ADD THIS
 
 def handle_file(msg_id, filename, filesize, sender_addr, sock):
     """Processa um pedido FILE, prepara para receber e envia ACK."""
@@ -465,17 +456,16 @@ def handle_nack(nack_id, reason, sender_addr):
 def send_heartbeat(sock):
     """Thread para enviar HEARTBEAT periodicamente via broadcast."""
     heartbeat_message = create_message("HEARTBEAT", DEVICE_NAME)
+    print("[DEBUG] Heartbeat thread iniciada.")
     while not shutdown_flag.is_set():
         try:
-            # Enviar para broadcast
+            print(f"[DEBUG] Tentando enviar HEARTBEAT: {heartbeat_message.decode()}")
             sock.sendto(heartbeat_message, (BROADCAST_ADDR, DEFAULT_PORT))
-            # print("DEBUG: HEARTBEAT enviado") # Debug
+            print(f"[DEBUG] HEARTBEAT enviado para {(BROADCAST_ADDR, DEFAULT_PORT)}")
         except socket.error as e:
              print(f"[Erro] Falha ao enviar HEARTBEAT: {e}", file=sys.stderr)
         except Exception as e:
              print(f"[Erro] Erro inesperado no envio de HEARTBEAT: {e}", file=sys.stderr)
-
-        # Esperar o intervalo, verificando o shutdown_flag periodicamente
         shutdown_flag.wait(HEARTBEAT_INTERVAL)
 
 def check_timeouts(sock):
@@ -492,7 +482,7 @@ def check_timeouts(sock):
                     if info['retries'] < MAX_RETRIES:
                         # Retransmitir
                         info['retries'] += 1
-                        info['timestamp'] = now # Reset timestamp para próxima tentativa
+                        info['timestamp'] = now
                         acks_to_retry.append((info['message'], info['target'], msg_id, info['retries']))
                         # print(f"DEBUG: Retransmitindo msg {msg_id} (tentativa {info['retries']}) para {info['target']}")
                     else:
@@ -549,12 +539,11 @@ def check_inactive_devices_internal(current_time):
 # --- Lógica do "Cliente" (Comandos do Usuário) ---
 
 def handle_user_commands(sock):
-    """Thread para processar comandos do usuário na CLI."""
     print("\n--- Interface de Comandos ---")
     print("Comandos disponíveis:")
     print("  devices                      - Lista dispositivos ativos")
-    print("  talk <nome> <mensagem>     - Envia mensagem de texto")
-    print("  sendfile <nome> <arquivo>  - Envia um arquivo")
+    print("  talk <nome> <mensagem>       - Envia mensagem de texto")
+    print("  sendfile <nome> <arquivo>    - Envia um arquivo")
     print("  quit                         - Encerra o dispositivo")
     print("-----------------------------")
 
@@ -590,11 +579,11 @@ def handle_user_commands(sock):
             else:
                 print(f"Comando desconhecido: {command}")
 
-        except EOFError: # Captura Ctrl+D
+        except EOFError:
              print("\n[Sistema] EOF recebido, encerrando...")
              shutdown_flag.set()
              break
-        except KeyboardInterrupt: # Captura Ctrl+C
+        except KeyboardInterrupt:
              print("\n[Sistema] Interrupção recebida, encerrando...")
              shutdown_flag.set()
              break
@@ -638,8 +627,8 @@ def send_talk_message(sock, target_name, message_text):
     print(f"[Sistema] Enviando mensagem para {target_name}...")
     send_udp_message(sock, message, target_addr, needs_ack=True, msg_id=msg_id, callback=talk_callback)
 
-# --- Lógica de Envio de Arquivo ---
 
+# --- Lógica de Envio de Arquivo ---
 def send_file(sock, target_name, filepath):
     """Inicia o processo de envio de arquivo."""
     target_addr = get_device_addr(target_name)
