@@ -218,6 +218,7 @@ def handle_talk(msg_id, content, sender_addr, sock):
     # Enviar ACK
     ack_msg = create_message("ACK", msg_id)
     send_udp_message(sock, ack_msg, sender_addr)
+    print(f"DEBUG: handle_talk em [{DEVICE_NAME}] processando msg_id={msg_id} de {sender_addr} com conteúdo '{content}'") # ADD THIS
 
 def handle_file(msg_id, filename, filesize, sender_addr, sock):
     """Processa um pedido FILE, prepara para receber e envia ACK."""
@@ -626,6 +627,7 @@ def talk_callback(msg_id, success, error_reason):
 def send_talk_message(sock, target_name, message_text):
     """Envia uma mensagem TALK para um dispositivo específico."""
     target_addr = get_device_addr(target_name)
+    print(f"DEBUG: Tentando enviar TALK para {target_name} no endereço {target_addr}")
     if not target_addr:
         print(f"[Erro] Dispositivo '{target_name}' não encontrado ou inativo.", file=sys.stderr)
         return
