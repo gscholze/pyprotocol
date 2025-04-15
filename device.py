@@ -673,45 +673,72 @@ def send_file(sock, target_name, filepath):
 def file_transfer_callback(msg_id, success, reason):
     """Callback para ACKs/NACKs/Timeouts de mensagens FILE, END e CHUNKs."""
     is_chunk_ack = '-' in msg_id # IDs de ACK de chunk são "transfer_id-seq"
+    print(f"\nDEBUG CALLBACK: Invocado com msg_id='{msg_id}', success={success}, reason='{reason}'")
 
     if is_chunk_ack:
+        print(f"DEBUG CALLBACK: Entrando no bloco IF (CHUNK ACK)")
         # Callback para ACK de CHUNK
         transfer_id, seq_str = msg_id.split('-', 1)
         try:
+             transfer_id, seq_str = msg_id.split('-', 1)
              seq = int(seq_str)
+             print(f"DEBUG CALLBACK: CHUNK ACK para transfer_id={transfer_id}, seq={seq}") # <<< NOVO DEBUG >>>
         except ValueError:
-             print(f"[Erro] ID de ACK de CHUNK inválido: {msg_id}", file=sys.stderr)
+             print(f"[Erro Callback] ID de ACK de CHUNK mal formatado (sem '-seq'?): {msg_id}", file=sys.stderr)
              return
 
-        with sends_lock:
-             transfer_info = ongoing_sends.get(transfer_id)
-             if not transfer_info:
-                 # Transferência pode ter sido cancelada/concluída
-                 print(f"DEBUG: ACK de CHUNK {seq} para transferência {transfer_id} não encontrada.")
-                 return
+        # with sends_lock:
+        #      transfer_info = ongoing_sends.get(transfer_id)
+        #      if not transfer_info:
+        #          # Transferência pode ter sido cancelada/concluída
+        #          print(f"DEBUG: ACK de CHUNK {seq} para transferência {transfer_id} não encontrada.")
+        #          return
 
-             if success:
-                 print(f"DEBUG: ACK recebido para CHUNK {seq} da transferência {transfer_id}")
-                 # Verificar se este ACK permite enviar o próximo chunk
-                 # A lógica de enviar o próximo chunk é melhor gerenciada após o envio inicial do FILE
-                 # e continuada aqui.
-                 if seq == transfer_info['next_seq'] - 1: # Confirmação do último enviado
-                     # Se ainda há chunks a enviar, envia o próximo
-                     if transfer_info['next_seq'] < transfer_info['total_chunks']:
-                          send_next_chunk(transfer_id, transfer_info)
-                     else:
-                          # Todos os chunks enviados e último ACK recebido, enviar END
-                          if not transfer_info.get('end_sent', False):
-                              send_end_message(transfer_id, transfer_info)
-             else:
-                 # Falha ao receber ACK do CHUNK (timeout ou NACK implícito)
-                 print(f"\n[Erro] Falha ao confirmar CHUNK {seq} para transferência {transfer_id}: {reason}", file=sys.stderr)
-                 # Abortar a transferência? Ou confiar na retransmissão geral?
-                 # Por segurança, vamos abortar aqui se um chunk falhar permanentemente
-                 print(f"[Transferência {transfer_id}] Abortando envio devido à falha no CHUNK {seq}.")
-                 if transfer_id in ongoing_sends:
-                      del ongoing_sends[transfer_id]
-                 # Limpar ACKs pendentes relacionados é complexo, a thread de timeout eventualmente fará isso.
+        #      if success:
+        #          print(f"DEBUG: ACK recebido para CHUNK {seq} da transferência {transfer_id}")
+        #          # Verificar se este ACK permite enviar o próximo chunk
+        #          # A lógica de enviar o próximo chunk é melhor gerenciada após o envio inicial do FILE
+        #          # e continuada aqui.
+        #          if seq == transfer_info['next_seq'] - 1: # Confirmação do último enviado
+        #              # Se ainda há chunks a enviar, envia o próximo
+        #              if transfer_info['next_seq'] < transfer_info['total_chunks']:
+        #                   send_next_chunk(transfer_id, transfer_info)
+        #              else:
+        #                   # Todos os chunks enviados e último ACK recebido, enviar END
+        #                   if not transfer_info.get('end_sent', False):
+        #                       send_end_message(transfer_id, transfer_info)
+        #      else:
+        #          # Falha ao receber ACK do CHUNK (timeout ou NACK implícito)
+        #          print(f"\n[Erro] Falha ao confirmar CHUNK {seq} para transferência {transfer_id}: {reason}", file=sys.stderr)
+        #          # Abortar a transferência? Ou confiar na retransmissão geral?
+        #          # Por segurança, vamos abortar aqui se um chunk falhar permanentemente
+        #          print(f"[Transferência {transfer_id}] Abortando envio devido à falha no CHUNK {seq}.")
+        #          if transfer_id in ongoing_sends:
+        #               del ongoing_sends[transfer_id]
+        #          # Limpar ACKs pendentes relacionados é complexo, a thread de timeout eventualmente fará isso.
+
+        # --- Lógica para CHUNK ---
+        with sends_lock:
+            transfer_info = ongoing_sends.get(transfer_id)
+            if not transfer_info:
+                print(f"DEBUG CALLBACK: Transferência {transfer_id} não encontrada para CHUNK ACK/Timeout.")
+                return
+
+            if success:
+                # print(f"DEBUG: ACK recebido para CHUNK {seq} da transferência {transfer_id}")
+                if seq == transfer_info['next_seq'] - 1: # Confirmação do último enviado
+                    if transfer_info['next_seq'] < transfer_info['total_chunks']:
+                        send_next_chunk(sock, transfer_id, transfer_info) # Passa sock global
+                    else:
+                        if not transfer_info.get('end_sent', False):
+                            send_end_message(sock, transfer_id, transfer_info) # Passa sock global
+            else:
+                # Falha ao receber ACK do CHUNK (timeout disparou este callback)
+                print(f"[Erro Callback] Falha ao confirmar CHUNK {seq} para {transfer_id}: {reason}", file=sys.stderr)
+                print(f"[Transferência {transfer_id}] Abortando envio devido à falha no CHUNK {seq}.")
+                if transfer_id in ongoing_sends:
+                    del ongoing_sends[transfer_id]
+
 
     else: # Callback para FILE ou END (msg_id == transfer_id)
         transfer_id = msg_id
@@ -744,7 +771,7 @@ def file_transfer_callback(msg_id, success, reason):
 
 def send_next_chunk(transfer_id, transfer_info):
     """Lê e envia o próximo chunk do arquivo."""
-    global sock # Precisa do socket global aqui
+    global sock
 
     seq = transfer_info['next_seq']
     filepath = transfer_info['filepath']
@@ -793,7 +820,7 @@ def send_next_chunk(transfer_id, transfer_info):
 
 def send_end_message(transfer_id, transfer_info):
     """Envia a mensagem END para finalizar a transferência."""
-    global sock # Precisa do socket global aqui
+    global sock
 
     target_addr = transfer_info['target_addr']
     file_hash = transfer_info['file_hash']
