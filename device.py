@@ -33,7 +33,6 @@ CHUNK_SIZE = 512  # raw bytes per file chunk (before base64)
 MAX_UDP_PAYLOAD = 65_507  # theoretical limit for IPv4
 DEVICE_NAME = socket.gethostname()
 
-# Callback signature type
 CallbackType: TypeAlias = Optional[Callable[[str, bool, Optional[str]], None]]
 
 
@@ -249,7 +248,7 @@ def handle_incoming_file(
         received_msg_ids.append(msg_id)
     safe_filename = Path(filename).name
     temp_path = safe_filename + ".part"
-    fh: Optional[io.BufferedWriter] = None  # Initialize fh
+    fh: Optional[io.BufferedWriter] = None
     try:
         fh = open(temp_path, "wb")
     except OSError as exc:
@@ -290,10 +289,10 @@ def handle_chunk(
             return
         send_udp(sock_param, create_message("ACK", f"{transfer_id}-{seq}"), sender)
         if seq < info["next_seq"] or seq in info["chunks"]:
-            return  # duplicate
+            return
 
         try:
-            data = base64.b64decode(b64)  # returns bytes
+            data = base64.b64decode(b64)
         except base64.binascii.Error:
             return
 
@@ -474,7 +473,7 @@ def send_file(
         return
 
     try:
-        size = os.path.getsize(path_str)  # int
+        size = os.path.getsize(path_str)
     except OSError as exc:
         print(f"[Erro] ficheiro: {exc}")
         return
@@ -558,7 +557,7 @@ def send_next_chunk(tid: str, info: OngoingSendInfo) -> None:
     try:
         with open(info["path"], "rb") as fh:
             fh.seek(seq * CHUNK_SIZE)
-            data = fh.read(CHUNK_SIZE)  # bytes
+            data = fh.read(CHUNK_SIZE)
     except OSError as e:
         print(f"\n[Erro] Falha ao ler chunk {seq} do ficheiro {info['path']}: {e}")
         with sends_lock:
@@ -710,7 +709,7 @@ def main() -> None:
                         partial_file = Path(info["filename"] + ".part")
                         partial_file.unlink(missing_ok=True)
                         print(f" - Removido {partial_file.name} (ID: {tid})")
-                    except Exception as e:  # Catch potential errors during cleanup
+                    except Exception as e:
                         print(f"Erro ao limpar {tid}: {e}")
         print("Programa finalizado.")
 
