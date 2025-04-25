@@ -1,924 +1,718 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import os
+import select
 import socket
+import sys
 import threading
 import time
 import uuid
-import hashlib
-import base64
-import os
-import sys
 from collections import deque
+from pathlib import Path
 
-# --- Constantes ---
-DEFAULT_PORT = 55555
-BROADCAST_ADDR = "255.255.255.255" # Ou o endereço de broadcast específico da rede
-HEARTBEAT_INTERVAL = 5  # Segundos
-DEVICE_TIMEOUT = 15     # Segundos (maior que 2 * HEARTBEAT_INTERVAL)
-ACK_TIMEOUT = 2         # Segundos para esperar por um ACK
-MAX_RETRIES = 3         # Máximo de retransmissões
-CHUNK_SIZE = 1024       # Tamanho do bloco de dados para CHUNK (bytes antes do base64)
-MAX_MESSAGE_SIZE = 65507 # Tamanho máximo teórico do payload UDP
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypedDict,
+    TypeAlias,
+)
 
-# --- Estruturas de Dados Globais (Protegidas por Locks) ---
-active_devices = {}  # { 'nome': {'ip': str, 'port': int, 'last_heartbeat': float} }
-pending_acks = {}    # { 'msg_id': {'target': (ip, port), 'message': bytes, 'timestamp': float, 'retries': int, 'callback': callable} }
-ongoing_sends = {}   # { 'transfer_id': {'target_name': str, 'filepath': str, 'file_size': int, 'total_chunks': int, 'next_seq': int, 'file_hash': str, 'ack_received': bool} }
-ongoing_receives = {} # { 'transfer_id': {'sender': (ip, port), 'filename': str, 'file_size': int, 'chunks': {seq: data}, 'total_chunks': None, 'file_handle': file, 'received_bytes': int} }
-received_msg_ids = deque(maxlen=100) # Guarda IDs recentes para evitar duplicatas (exceto CHUNKs que têm sua própria lógica)
+DEFAULT_PORT = 55_555
+BROADCAST_ADDR = "255.255.255.255"
+HEARTBEAT_INTERVAL = 5  # seconds
+DEVICE_TIMEOUT = 3 * HEARTBEAT_INTERVAL
+ACK_TIMEOUT = 5  # seconds before retrying a message
+MAX_RETRIES = 3  # retransmissions before giving up
+CHUNK_SIZE = 512  # raw bytes per file chunk (before base64)
+MAX_UDP_PAYLOAD = 65_507  # theoretical limit for IPv4
+DEVICE_NAME = socket.gethostname()
 
-# Locks para proteger o acesso concorrente às estruturas de dados
+CallbackType: TypeAlias = Optional[Callable[[str, bool, Optional[str]], None]]
+
+
+class ActiveDeviceInfo(TypedDict):
+    ip: str
+    port: int
+    last: float
+
+
+class PendingAckInfo(TypedDict):
+    target: Tuple[str, int]
+    payload: bytes
+    timestamp: float
+    retries: int
+    callback: CallbackType
+
+
+class OngoingSendInfo(TypedDict):
+    path: Path
+    addr: Tuple[str, int]
+    size: int
+    chunks: int
+    next_seq: int
+    hash: str
+    end_sent: bool
+
+
+class OngoingReceiveInfo(TypedDict):
+    sender: Tuple[str, int]
+    filename: str
+    size: int
+    next_seq: int
+    total_chunks: int
+    chunks: Dict[int, bytes]
+    fh: io.BufferedWriter
+    received: int
+
+
+active_devices: Dict[str, ActiveDeviceInfo] = {}
+pending_acks: Dict[str, PendingAckInfo] = {}
+ongoing_sends: Dict[str, OngoingSendInfo] = {}
+ongoing_receives: Dict[str, OngoingReceiveInfo] = {}
+received_msg_ids: deque[str] = deque(maxlen=100)  # de‑duplication window
+
 devices_lock = threading.Lock()
 acks_lock = threading.Lock()
 sends_lock = threading.Lock()
 receives_lock = threading.Lock()
 received_ids_lock = threading.Lock()
 
-# Flag para sinalizar o encerramento das threads
 shutdown_flag = threading.Event()
 
-# Nome do dispositivo (pode ser pego do hostname ou argumento)
-DEVICE_NAME = socket.gethostname()
+sock: socket.socket
 
-# --- Funções Auxiliares ---
 
-def get_device_addr(device_name):
-    """Retorna (ip, port) do dispositivo pelo nome, ou None se não encontrado."""
+def get_device_addr(name: str) -> Optional[Tuple[str, int]]:
+    """Return (ip, port) of a peer by name or None if unknown/inactive."""
     with devices_lock:
-        device_info = active_devices.get(device_name)
-        if device_info:
-            return (device_info['ip'], device_info['port'])
-    return None
+        info = active_devices.get(name)
+        return (info["ip"], info["port"]) if info else None
 
-def create_message(command, *args):
-    """Cria uma mensagem formatada como bytes."""
-    message = f"{command}"
-    for arg in args:
-        message += f" {arg}"
-    return message.encode('utf-8')
 
-def parse_message(data, addr):
-    """Decodifica e parseia a mensagem recebida."""
+def create_message(cmd: str, *args: object) -> bytes:
+    """Build a space‑separated UTF‑8 message ready for sendto."""
+    return f"{cmd} {' '.join(map(str, args))}".encode()
+
+
+def parse_message(
+    data: bytes, addr: Tuple[str, int]
+) -> Tuple[str, List[str], Tuple[str, int]]:
+    """Decode raw UDP payload into (command, args, sender_addr)."""
     try:
-        message = data.decode('utf-8')
-        parts = message.split(' ', 2) # Divide no máximo 2 vezes para pegar comando, id/nome, resto
-        command = parts[0]
+        text = data.decode()
+        parts = text.split(" ", 2)
+        cmd = parts[0]
         args = parts[1:] if len(parts) > 1 else []
-        return command, args, addr
-    except Exception as e:
-        print(f"[Erro] Falha ao parsear mensagem de {addr}: {e}", file=sys.stderr)
-        return None, None, addr
+        return cmd, args, addr
+    except UnicodeDecodeError:
+        print(f"[Aviso] mensagem inválida de {addr}")
+        return "", [], addr
 
-def calculate_file_hash(filepath):
-    """Calcula o hash SHA-256 de um arquivo."""
-    hasher = hashlib.sha256()
+
+def file_sha256(path: os.PathLike[str] | str) -> Optional[str]:
+    """Return SHA‑256 hex digest of *path* or None on error."""
     try:
-        with open(filepath, 'rb') as f:
-            while True:
-                chunk = f.read(4096) # Ler em blocos para arquivos grandes
-                if not chunk:
-                    break
+        hasher = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while chunk := fh.read(4096):
                 hasher.update(chunk)
         return hasher.hexdigest()
-    except FileNotFoundError:
-        return None
-    except Exception as e:
-        print(f"[Erro] Falha ao calcular hash de {filepath}: {e}", file=sys.stderr)
+    except OSError as exc:
+        print(f"[Erro] Falha ao calcular hash de {path}: {exc}", file=sys.stderr)
         return None
 
-def send_udp_message(sock, message_bytes, addr, needs_ack=False, msg_id=None, callback=None):
-    """Envia uma mensagem UDP. Se needs_ack=True, registra para retransmissão."""
+
+def send_udp(
+    sock_param: socket.socket,
+    payload: bytes,
+    target: Tuple[str, int],
+    *,
+    needs_ack: bool = False,
+    msg_id: str | None = None,
+    cb: CallbackType = None,
+) -> None:
+    """Send *payload* and optionally register it in *pending_acks*."""
     try:
-        sock.sendto(message_bytes, addr)
-        # print(f"DEBUG: Enviado {message_bytes[:60]}... para {addr}") # Debug
+        sock_param.sendto(payload, target)
         if needs_ack and msg_id:
             with acks_lock:
                 pending_acks[msg_id] = {
-                    'target': addr,
-                    'message': message_bytes,
-                    'timestamp': time.time(),
-                    'retries': 0,
-                    'callback': callback # Função a ser chamada em caso de sucesso (ACK) ou falha
+                    "target": target,
+                    "payload": payload,
+                    "timestamp": time.time(),
+                    "retries": 0,
+                    "callback": cb,
                 }
-    except socket.error as e:
-        print(f"[Erro] Falha ao enviar mensagem para {addr}: {e}", file=sys.stderr)
-        # Se falhar ao enviar, chamar callback de falha imediatamente se houver
-        if needs_ack and msg_id and callback:
-            try:
-                callback(msg_id, False, "Erro de socket ao enviar") # Falha
-            except Exception as cb_e:
-                print(f"[Erro] Callback de falha falhou: {cb_e}", file=sys.stderr)
-    except Exception as e:
-         print(f"[Erro] Erro inesperado ao enviar/registrar ACK: {e}", file=sys.stderr)
+    except OSError as exc:
+        print(f"[Erro] Falha ao enviar para {target}: {exc}", file=sys.stderr)
+        if needs_ack and msg_id and cb:
+            cb(msg_id, False, "erro de socket")
 
 
-# --- Lógica do "Servidor" (Escuta e Resposta) ---
+def listener(sock_param: socket.socket) -> None:
+    print(f"[{DEVICE_NAME}] ouvindo em 0.0.0.0:{sock_param.getsockname()[1]}")
 
-def handle_incoming_messages(sock):
-    """Thread principal para receber e processar mensagens UDP."""
-    print(f"[{DEVICE_NAME}] Ouvindo em UDP 0.0.0.0:{DEFAULT_PORT}")
     while not shutdown_flag.is_set():
-        try:
-            # Usar select para não bloquear indefinidamente e permitir shutdown
-            ready, _, _ = select.select([sock], [], [], 0.5) # Timeout de 0.5s
-            if ready:
-                data, addr = sock.recvfrom(MAX_MESSAGE_SIZE)
-                # print(f"DEBUG: Recebido {data[:60]}... de {addr}") # Debug
-
-                # Ignorar mensagens de si mesmo (alguns sistemas operacionais retornam broadcasts)
-                # Obter o IP local pode ser complexo, uma simplificação é checar a porta se for a mesma
-                # Mas a melhor forma é comparar o nome após o HEARTBEAT inicial
-                # Por agora, vamos processar e deixar o handler do HEARTBEAT filtrar
-                # if addr[0] == my_ip and addr[1] == DEFAULT_PORT: continue
-
-                command, args, sender_addr = parse_message(data, addr)
-                if not command:
-                    continue
-
-                # Processar baseado no comando
-                if command == "HEARTBEAT":
-                    if len(args) >= 1:
-                        handle_heartbeat(args[0], sender_addr)
-                elif command == "TALK":
-                    if len(args) >= 2:
-                        msg_id = args[0]
-                        content = args[1]
-                        handle_talk(msg_id, content, sender_addr, sock)
-                elif command == "FILE":
-                    if len(args) >= 3:
-                        msg_id = args[0]
-                        filename = args[1]
-                        try:
-                            filesize = int(args[2])
-                            handle_file(msg_id, filename, filesize, sender_addr, sock)
-                        except ValueError:
-                            print(f"[Aviso] Tamanho de arquivo inválido recebido de {sender_addr}: {args[2]}")
-                            send_udp_message(sock, create_message("NACK", msg_id, "Tamanho inválido"), sender_addr)
-                elif command == "CHUNK":
-                     if len(args) >= 3:
-                        msg_id = args[0] # ID da transferência, não da mensagem CHUNK em si
-                        try:
-                            seq = int(args[1])
-                            data_b64 = args[2]
-                            handle_chunk(msg_id, seq, data_b64, sender_addr, sock)
-                        except ValueError:
-                             print(f"[Aviso] Sequência CHUNK inválida recebida de {sender_addr}: {args[1]}")
-                             # Não enviar NACK aqui, pois o remetente espera ACK do CHUNK específico
-                        except IndexError:
-                             print(f"[Aviso] Mensagem CHUNK mal formatada de {sender_addr}")
-                elif command == "END":
-                     if len(args) >= 2:
-                        msg_id = args[0] # ID da transferência
-                        file_hash = args[1]
-                        handle_end(msg_id, file_hash, sender_addr, sock)
-                elif command == "ACK":
-                     if len(args) >= 1:
-                        ack_id = args[0]
-                        handle_ack(ack_id, sender_addr)
-                elif command == "NACK":
-                     if len(args) >= 2:
-                        nack_id = args[0]
-                        reason = args[1]
-                        handle_nack(nack_id, reason, sender_addr)
-                else:
-                    print(f"[Aviso] Comando desconhecido '{command}' recebido de {sender_addr}")
-
-        except socket.timeout:
-            continue # Timeout é esperado por causa do select
-        except Exception as e:
-            if not shutdown_flag.is_set():
-                 print(f"[Erro] Erro no loop de escuta: {e}", file=sys.stderr)
-            time.sleep(0.1) # Evitar spam de erros
-
-def handle_heartbeat(sender_name, sender_addr):
-    """Processa uma mensagem HEARTBEAT."""
-    if sender_name == DEVICE_NAME: # Ignorar próprio heartbeat
-        return
-    #print(f"DEBUG: Recebido HEARTBEAT de {sender_name} @ {sender_addr}")
-    with devices_lock:
-        now = time.time()
-        active_devices[sender_name] = {
-            'ip': sender_addr[0],
-            'port': sender_addr[1],
-            'last_heartbeat': now
-        }
-        # Limpar dispositivos inativos (melhor fazer em thread separada, mas ok aqui por simplicidade)
-        # check_inactive_devices_internal(now) # Chama a lógica interna sem lock
-
-def handle_talk(msg_id, content, sender_addr, sock):
-    """Processa uma mensagem TALK e envia ACK."""
-    # Detecção de duplicata simples
-    with received_ids_lock:
-        if msg_id in received_msg_ids:
-            print(f"[Aviso] Mensagem TALK duplicada {msg_id} de {sender_addr}, reenviando ACK.")
-            ack_msg = create_message("ACK", msg_id)
-            send_udp_message(sock, ack_msg, sender_addr)
-            return
-        received_msg_ids.append(msg_id)
-
-    print(f"\n[Mensagem de {sender_addr[0]}]: {content}")
-    # Enviar ACK
-    ack_msg = create_message("ACK", msg_id)
-    send_udp_message(sock, ack_msg, sender_addr)
-
-def handle_file(msg_id, filename, filesize, sender_addr, sock):
-    """Processa um pedido FILE, prepara para receber e envia ACK."""
-    with received_ids_lock:
-        if msg_id in received_msg_ids:
-            print(f"[Aviso] Mensagem FILE duplicada {msg_id} de {sender_addr}, reenviando ACK.")
-            ack_msg = create_message("ACK", msg_id)
-            send_udp_message(sock, ack_msg, sender_addr)
-            return
-        received_msg_ids.append(msg_id)
-
-    # Verifica se já existe uma transferência com esse ID (improvável, mas seguro)
-    with receives_lock:
-        if msg_id in ongoing_receives:
-             print(f"[Aviso] Transferência FILE {msg_id} já em andamento. Ignorando duplicata.")
-             # Reenvia ACK caso o remetente não tenha recebido
-             ack_msg = create_message("ACK", msg_id)
-             send_udp_message(sock, ack_msg, sender_addr)
-             return
-
-        # Criar arquivo temporário ou final? Vamos usar final com sufixo .part
-        safe_filename = os.path.basename(filename) # Evitar path traversal
-        local_filepath = f"{safe_filename}.part"
-        try:
-            file_handle = open(local_filepath, 'wb')
-        except Exception as e:
-             print(f"[Erro] Não foi possível criar o arquivo local {local_filepath}: {e}", file=sys.stderr)
-             nack_msg = create_message("NACK", msg_id, f"Erro ao criar arquivo local: {e}")
-             send_udp_message(sock, nack_msg, sender_addr)
-             return
-
-        total_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE if filesize > 0 else 1
-
-        ongoing_receives[msg_id] = {
-            'sender': sender_addr,
-            'filename': safe_filename,
-            'file_size': filesize,
-            'chunks': {}, # Armazena chunks fora de ordem aqui {seq: data_bytes}
-            'total_chunks': total_chunks,
-            'next_expected_seq': 0,
-            'file_handle': file_handle,
-            'received_bytes': 0
-        }
-        print(f"\n[Transferência] Iniciando recebimento de '{safe_filename}' ({filesize} bytes) de {sender_addr[0]}. ID: {msg_id}")
-
-    # Enviar ACK para FILE
-    ack_msg = create_message("ACK", msg_id)
-    send_udp_message(sock, ack_msg, sender_addr)
-
-def handle_chunk(transfer_id, seq, data_b64, sender_addr, sock):
-    """Processa uma mensagem CHUNK, armazena ou escreve, e envia ACK."""
-    with receives_lock:
-        transfer_info = ongoing_receives.get(transfer_id)
-        if not transfer_info or transfer_info['sender'] != sender_addr:
-            print(f"[Aviso] CHUNK recebido para transferência desconhecida ({transfer_id}) ou remetente errado ({sender_addr}). Ignorando.")
-            # Não enviar NACK, pode ser pacote antigo/perdido
-            return
-
-        # Enviar ACK para o CHUNK *antes* de processar (confirma recebimento da mensagem)
-        # Usar um ID único para o ACK do CHUNK para não confundir com o ACK do FILE/END
-        chunk_ack_id = f"{transfer_id}-{seq}"
-        ack_msg = create_message("ACK", chunk_ack_id) # ACK específico para este chunk
-        send_udp_message(sock, ack_msg, sender_addr)
-
-        # Detecção de CHUNK duplicado (já escrito ou na fila)
-        if seq < transfer_info['next_expected_seq'] or seq in transfer_info['chunks']:
-            print(f"[Aviso] CHUNK duplicado seq={seq} para {transfer_id}. Ignorando dados.")
-            return # Já processamos ou temos na fila, mas o ACK foi reenviado acima
-
-        # Decodificar dados
-        try:
-            chunk_data = base64.b64decode(data_b64)
-        except Exception as e:
-            print(f"[Erro] Falha ao decodificar base64 do CHUNK seq={seq} para {transfer_id}: {e}")
-            # O remetente vai retransmitir se não receber o ACK específico do chunk
-            return
-
-        # Armazenar ou escrever?
-        file_handle = transfer_info['file_handle']
-        if seq == transfer_info['next_expected_seq']:
-            # Chunk esperado, escrever diretamente
+        ready, _, _ = select.select([sock_param], [], [], 0.5)
+        if not ready:
+            continue
+        data, addr = sock_param.recvfrom(MAX_UDP_PAYLOAD)
+        cmd, args, sender = parse_message(data, addr)
+        if not cmd:
+            continue
+        if cmd == "HEARTBEAT" and args:
+            handle_heartbeat(args[0], sender)
+        elif cmd == "TALK" and len(args) >= 2:
+            handle_talk(args[0], " ".join(args[1:]), sender, sock_param)
+        elif cmd == "FILE" and len(args) >= 2:
+            handle_incoming_file(args[0], " ".join(args[1:]), sender, sock_param)
+        elif cmd == "CHUNK" and len(args) == 2:
             try:
-                file_handle.write(chunk_data)
-                transfer_info['received_bytes'] += len(chunk_data)
-                transfer_info['next_expected_seq'] += 1
-                # Verificar se há chunks subsequentes na fila para escrever
-                while transfer_info['next_expected_seq'] in transfer_info['chunks']:
-                    next_seq = transfer_info['next_expected_seq']
-                    queued_data = transfer_info['chunks'].pop(next_seq)
-                    file_handle.write(queued_data)
-                    transfer_info['received_bytes'] += len(queued_data)
-                    transfer_info['next_expected_seq'] += 1
-            except Exception as e:
-                print(f"[Erro] Falha ao escrever CHUNK seq={seq} no arquivo {transfer_info['filename']}: {e}")
-                # Limpeza pode ser necessária aqui ou no END/NACK
-                # O remetente vai retransmitir, mas podemos ter problemas com o arquivo local
-        elif seq > transfer_info['next_expected_seq']:
-            # Chunk fora de ordem, armazenar temporariamente
-            print(f"[Transferência] Recebido CHUNK fora de ordem seq={seq} (esperando {transfer_info['next_expected_seq']}) para {transfer_id}. Armazenando.")
-            transfer_info['chunks'][seq] = chunk_data
-        # else: seq < next_expected_seq (duplicado, já tratado)
-
-        # Exibir progresso
-        if transfer_info['file_size'] > 0:
-             progress = (transfer_info['received_bytes'] / transfer_info['file_size']) * 100
-             print(f"\r[Transferência {transfer_id}] Recebendo '{transfer_info['filename']}': {transfer_info['received_bytes']}/{transfer_info['file_size']} bytes ({progress:.2f}%)", end="")
-
-
-def handle_end(transfer_id, received_hash, sender_addr, sock):
-    """Processa a mensagem END, verifica o hash e envia ACK ou NACK."""
-    with receives_lock:
-        transfer_info = ongoing_receives.get(transfer_id)
-        if not transfer_info or transfer_info['sender'] != sender_addr:
-            print(f"[Aviso] END recebido para transferência desconhecida ({transfer_id}) ou remetente errado ({sender_addr}). Ignorando.")
-            return
-
-        # Fechar o arquivo para garantir que tudo foi escrito no disco
-        file_handle = transfer_info['file_handle']
-        local_filepath = file_handle.name
-        file_handle.close()
-
-        final_filename = transfer_info['filename']
-        print(f"\n[Transferência {transfer_id}] Recebimento de '{final_filename}' concluído. Verificando integridade...")
-
-        # Verificar se todos os chunks esperados foram recebidos (contagem ou tamanho)
-        # next_expected_seq deve ser igual ao total_chunks
-        all_chunks_received = (transfer_info['next_expected_seq'] == transfer_info['total_chunks'])
-        size_matches = (transfer_info['received_bytes'] == transfer_info['file_size'])
-
-        if not all_chunks_received or not size_matches:
-             print(f"[Erro] Transferência {transfer_id} incompleta. Bytes: {transfer_info['received_bytes']}/{transfer_info['file_size']}, Chunks: {transfer_info['next_expected_seq']}/{transfer_info['total_chunks']}", file=sys.stderr)
-             reason = "Transferência incompleta"
-             nack_msg = create_message("NACK", transfer_id, reason)
-             send_udp_message(sock, nack_msg, sender_addr)
-             # Remover arquivo parcial e estado
-             try:
-                 os.remove(local_filepath)
-             except OSError as e:
-                 print(f"[Erro] Falha ao remover arquivo parcial {local_filepath}: {e}", file=sys.stderr)
-             del ongoing_receives[transfer_id]
-             return
-
-        # Calcular hash local
-        local_hash = calculate_file_hash(local_filepath)
-
-        if local_hash and local_hash == received_hash:
-            # Hash OK! Renomear arquivo e enviar ACK
-            print(f"[Transferência {transfer_id}] Hash verificado com sucesso!")
-            try:
-                os.rename(local_filepath, final_filename)
-                print(f"[Transferência {transfer_id}] Arquivo '{final_filename}' salvo.")
-                ack_msg = create_message("ACK", transfer_id) # ACK para o END
-                send_udp_message(sock, ack_msg, sender_addr)
-            except OSError as e:
-                print(f"[Erro] Falha ao renomear {local_filepath} para {final_filename}: {e}", file=sys.stderr)
-                reason = f"Erro ao finalizar arquivo local: {e}"
-                nack_msg = create_message("NACK", transfer_id, reason)
-                send_udp_message(sock, nack_msg, sender_addr)
-                # Tentar remover o .part se a renomeação falhou
-                try: os.remove(local_filepath)
-                except OSError: pass
+                tid = args[0]
+                seq_str, b64_data = args[1].split(" ", 1)
+                seq = int(seq_str)
+                handle_chunk(tid, seq, b64_data, sender, sock_param)
+            except (ValueError, IndexError):
+                print(f"[Aviso] formato inválido de CHUNK de {sender}: {args}")
+        elif cmd == "END" and len(args) >= 2:
+            handle_end(args[0], args[1], sender, sock_param)
+        elif cmd == "ACK" and args:
+            handle_ack(args[0], sender)
+        elif cmd == "NACK" and len(args) >= 2:
+            handle_nack(args[0], args[1], sender)
         else:
-            # Hash Falhou! Enviar NACK e remover arquivo
-            print(f"[Erro] Falha na verificação de Hash para {transfer_id}!", file=sys.stderr)
-            print(f"  Recebido: {received_hash}", file=sys.stderr)
-            print(f"  Calculado: {local_hash}", file=sys.stderr)
-            reason = "Falha na verificação de hash"
-            nack_msg = create_message("NACK", transfer_id, reason)
-            send_udp_message(sock, nack_msg, sender_addr)
-            try:
-                os.remove(local_filepath)
-                print(f"[Transferência {transfer_id}] Arquivo corrompido '{local_filepath}' removido.")
-            except OSError as e:
-                print(f"[Erro] Falha ao remover arquivo corrompido {local_filepath}: {e}", file=sys.stderr)
-
-        # Limpar estado da transferência
-        if transfer_id in ongoing_receives:
-           del ongoing_receives[transfer_id]
+            print(f"[Warn] comando desconhecido '{cmd}' de {sender}")
 
 
-def handle_ack(ack_id, sender_addr):
-    """Processa uma mensagem ACK, removendo a mensagem correspondente de pending_acks."""
-    with acks_lock:
-        pending_info = pending_acks.get(ack_id)
-        if pending_info:
-            # Verificar se o ACK veio do alvo esperado
-            if pending_info['target'] == sender_addr or pending_info['target'][0] == BROADCAST_ADDR: # Aceitar ACK de qqr lugar se foi broadcast? Não faz sentido para ACKs. Melhor checar o target.
-                 # print(f"DEBUG: Recebido ACK para {ack_id} de {sender_addr}")
-                 callback = pending_info.get('callback')
-                 del pending_acks[ack_id] # Remove da fila de espera
-
-                 # Chamar callback de sucesso, se houver
-                 if callback:
-                     try:
-                         callback(ack_id, True, None) # Sucesso
-                     except Exception as e:
-                         print(f"[Erro] Callback de sucesso para ACK {ack_id} falhou: {e}", file=sys.stderr)
-
-            else:
-                print(f"[Aviso] ACK para {ack_id} recebido de endereço inesperado {sender_addr} (esperado de {pending_info['target']}). Ignorando.")
-        # else:
-            # print(f"DEBUG: ACK recebido para msg_id {ack_id} não pendente ou já processado.")
+def handle_heartbeat(name: str, sender: Tuple[str, int]) -> None:
+    if name == DEVICE_NAME:
+        return
+    with devices_lock:
+        active_devices[name] = {
+            "ip": sender[0],
+            "port": sender[1],
+            "last": time.time(),
+        }
 
 
-def handle_nack(nack_id, reason, sender_addr):
-    """Processa uma mensagem NACK."""
-    print(f"\n[NACK Recebido] Mensagem/Transferência {nack_id} falhou. Motivo: {reason} (de {sender_addr[0]})")
-    with acks_lock:
-        pending_info = pending_acks.get(nack_id)
-        if pending_info and pending_info['target'] == sender_addr:
-            callback = pending_info.get('callback')
-            del pending_acks[nack_id] # Remove da fila de espera
-
-            # Chamar callback de falha, se houver
-            if callback:
-                try:
-                    callback(nack_id, False, f"NACK recebido: {reason}") # Falha
-                except Exception as e:
-                     print(f"[Erro] Callback de NACK para {nack_id} falhou: {e}", file=sys.stderr)
-
-    # Lógica adicional pode ser necessária dependendo do NACK
-    # Por exemplo, limpar estado de transferência de arquivo se o NACK for para FILE ou END
-    with sends_lock:
-        if nack_id in ongoing_sends:
-            print(f"[Transferência {nack_id}] Falha no envio de arquivo confirmada por NACK.")
-            del ongoing_sends[nack_id]
-            # Limpar ACKs pendentes relacionados a esta transferência (CHUNKS) pode ser complexo
-            # Uma abordagem é o callback limpar os ACKs pendentes para os chunks dessa transferência
-
-    with receives_lock:
-        if nack_id in ongoing_receives:
-            print(f"[Transferência {nack_id}] Falha no recebimento de arquivo confirmada por NACK (remoto).")
-            transfer_info = ongoing_receives[nack_id]
-            try:
-                transfer_info['file_handle'].close()
-                os.remove(transfer_info['file_handle'].name)
-            except Exception as e:
-                print(f"[Erro] Falha ao limpar arquivo parcial após NACK remoto: {e}", file=sys.stderr)
-            del ongoing_receives[nack_id]
-
-
-# --- Lógica Periódica (Heartbeat e Timeouts) ---
-
-def send_heartbeat(sock):
-    """Thread para enviar HEARTBEAT periodicamente via broadcast."""
-    heartbeat_message = create_message("HEARTBEAT", DEVICE_NAME)
+def heartbeat_sender(sock_param: socket.socket) -> None:
+    payload = create_message("HEARTBEAT", DEVICE_NAME)
     while not shutdown_flag.is_set():
         try:
-            # Enviar para broadcast
-            sock.sendto(heartbeat_message, (BROADCAST_ADDR, DEFAULT_PORT))
-            # print("DEBUG: HEARTBEAT enviado") # Debug
-        except socket.error as e:
-             print(f"[Erro] Falha ao enviar HEARTBEAT: {e}", file=sys.stderr)
-        except Exception as e:
-             print(f"[Erro] Erro inesperado no envio de HEARTBEAT: {e}", file=sys.stderr)
-
-        # Esperar o intervalo, verificando o shutdown_flag periodicamente
+            sock_param.sendto(payload, (BROADCAST_ADDR, DEFAULT_PORT))
+        except OSError as exc:
+            print(f"[Erro] heartbeat: {exc}", file=sys.stderr)
         shutdown_flag.wait(HEARTBEAT_INTERVAL)
 
-def check_timeouts(sock):
-    """Thread para verificar timeouts de ACKs (retransmitir) e de dispositivos (remover)."""
+
+def handle_talk(
+    msg_id: str,
+    text: str,
+    sender: Tuple[str, int],
+    sock_param: socket.socket,
+) -> None:
+    with received_ids_lock:
+        if msg_id in received_msg_ids:
+            send_udp(sock_param, create_message("ACK", msg_id), sender)
+            return
+        received_msg_ids.append(msg_id)
+
+    print(f"\n[{sender[0]}] {text}")
+    send_udp(sock_param, create_message("ACK", msg_id), sender)
+
+
+def handle_incoming_file(
+    msg_id: str,
+    rest: str,
+    sender: Tuple[str, int],
+    sock_param: socket.socket,
+) -> None:
+    """Prepare to receive a file; reply with ACK so the sender starts CHUNKs."""
+    try:
+        filename, size_str = rest.rsplit(" ", 1)
+        filesize = int(size_str)
+    except ValueError:
+        send_udp(sock_param, create_message("NACK", msg_id, "tamanho inválido"), sender)
+        return
+
+    with received_ids_lock:
+        if msg_id in received_msg_ids:
+            send_udp(sock_param, create_message("ACK", msg_id), sender)
+            return
+        received_msg_ids.append(msg_id)
+    safe_filename = Path(filename).name
+    temp_path = safe_filename + ".part"
+    fh: Optional[io.BufferedWriter] = None
+    try:
+        fh = open(temp_path, "wb")
+    except OSError as exc:
+        send_udp(
+            sock_param, create_message("NACK", msg_id, f"erro local: {exc}"), sender
+        )
+        return
+    assert fh is not None
+
+    total_chunks = max(1, (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    with receives_lock:
+        ongoing_receives[msg_id] = {
+            "sender": sender,
+            "filename": safe_filename,
+            "size": filesize,
+            "next_seq": 0,
+            "total_chunks": total_chunks,
+            "chunks": {},
+            "fh": fh,
+            "received": 0,
+        }
+    print(
+        f"\n[Transfer] recebendo '{safe_filename}' ({filesize} B) de {sender[0]} — id={msg_id}"
+    )
+    send_udp(sock_param, create_message("ACK", msg_id), sender)
+
+
+def handle_chunk(
+    transfer_id: str,
+    seq: int,
+    b64: str,
+    sender: Tuple[str, int],
+    sock_param: socket.socket,
+) -> None:
+    with receives_lock:
+        info = ongoing_receives.get(transfer_id)
+        if not info or info["sender"] != sender:
+            return
+        send_udp(sock_param, create_message("ACK", f"{transfer_id}-{seq}"), sender)
+        if seq < info["next_seq"] or seq in info["chunks"]:
+            return
+
+        try:
+            data = base64.b64decode(b64)
+        except base64.binascii.Error:
+            return
+
+        if seq == info["next_seq"]:
+            info["fh"].write(data)
+            info["received"] += len(data)
+            info["next_seq"] += 1
+            while info["next_seq"] in info["chunks"]:
+                queued_data = info["chunks"].pop(info["next_seq"])
+                info["fh"].write(queued_data)
+                info["received"] += len(queued_data)
+                info["next_seq"] += 1
+        else:
+            info["chunks"][seq] = data
+
+        if info["size"] > 0:
+            pct = info["received"] * 100 / info["size"]
+            print(
+                f"\r[Transfer {transfer_id}] {info['received']}/{info['size']} B"
+                f" ({pct:.1f} %)",
+                end="",
+            )
+        else:
+            print(
+                f"\r[Transfer {transfer_id}] {info['received']}/0 B (100.0 %)",
+                end="",
+            )
+
+
+def handle_end(
+    transfer_id: str,
+    remote_hash: str,
+    sender: Tuple[str, int],
+    sock_param: socket.socket,
+) -> None:
+    info: Optional[OngoingReceiveInfo] = None
+    with receives_lock:
+        info = ongoing_receives.get(transfer_id)
+        if not info or info["sender"] != sender:
+            return
+        info["fh"].close()
+    if info is None:
+        return
+
+    print(f"\n[Transfer {transfer_id}] verificando integridade...")
+    local_path = Path(info["filename"] + ".part")
+
+    local_hash = file_sha256(local_path)
+    ok = (
+        info["next_seq"] == info["total_chunks"]
+        and info["received"] == info["size"]
+        and local_hash is not None
+        and local_hash == remote_hash
+    )
+
+    if ok:
+        final_name = info["filename"]
+        try:
+            local_path.replace(final_name)
+            send_udp(sock_param, create_message("ACK", transfer_id), sender)
+            print(f"[Transfer {transfer_id}] concluída: {final_name}")
+        except OSError as e:
+            print(f"[Erro] Falha ao renomear {local_path} para {final_name}: {e}")
+            send_udp(
+                sock_param,
+                create_message("NACK", transfer_id, f"erro ao finalizar: {e}"),
+                sender,
+            )
+            local_path.unlink(missing_ok=True)
+
+    else:
+        send_udp(
+            sock_param,
+            create_message("NACK", transfer_id, "hash ou tamanho incorreto"),
+            sender,
+        )
+        local_path.unlink(missing_ok=True)
+        print(f"[Erro] transferência {transfer_id} falhou — ficheiro removido")
+
+    with receives_lock:
+        ongoing_receives.pop(transfer_id, None)
+
+
+def handle_ack(msg_id: str, sender: Tuple[str, int]) -> None:
+    with acks_lock:
+        info = pending_acks.pop(msg_id, None)
+
+    if info and (info["target"] == sender or info["target"][0] == BROADCAST_ADDR):
+        if cb := info.get("callback"):
+            cb(msg_id, True, None)
+
+
+def handle_nack(msg_id: str, reason: str, sender: Tuple[str, int]) -> None:
+    print(f"\n[NACK] {msg_id} de {sender[0]}: {reason}")
+    with acks_lock:
+        info = pending_acks.pop(msg_id, None)
+
+    if info and (cb := info.get("callback")):
+        cb(msg_id, False, f"nack: {reason}")
+
+
+def retry_manager(sock_param: socket.socket) -> None:
     while not shutdown_flag.is_set():
         now = time.time()
 
-        # 1. Verificar ACKs pendentes e retransmitir
-        acks_to_remove = []
-        acks_to_retry = []
+        to_retry: list[tuple[bytes, Tuple[str, int], str, int]] = []
+        to_drop: list[str] = []
+
         with acks_lock:
-            for msg_id, info in pending_acks.items():
-                if now - info['timestamp'] > ACK_TIMEOUT:
-                    if info['retries'] < MAX_RETRIES:
-                        # Retransmitir
-                        info['retries'] += 1
-                        info['timestamp'] = now # Reset timestamp para próxima tentativa
-                        acks_to_retry.append((info['message'], info['target'], msg_id, info['retries']))
-                        # print(f"DEBUG: Retransmitindo msg {msg_id} (tentativa {info['retries']}) para {info['target']}")
+            for mid, info in list(pending_acks.items()):
+                if now - info["timestamp"] > ACK_TIMEOUT:
+                    if info["retries"] < MAX_RETRIES:
+                        info["retries"] += 1
+                        info["timestamp"] = now
+                        to_retry.append(
+                            (info["payload"], info["target"], mid, info["retries"])
+                        )
                     else:
-                        # Máximo de retries atingido
-                        acks_to_remove.append(msg_id)
-                        print(f"\n[Erro] Timeout final: Nenhuma resposta para msg {msg_id} de {info['target']} após {MAX_RETRIES} tentativas.", file=sys.stderr)
-                        # Chamar callback de falha
-                        callback = info.get('callback')
-                        if callback:
-                             try:
-                                 callback(msg_id, False, f"Timeout final após {MAX_RETRIES} retentativas") # Falha
-                             except Exception as e:
-                                 print(f"[Erro] Callback de timeout final para {msg_id} falhou: {e}", file=sys.stderr)
+                        to_drop.append(mid)
+                        if cb := info.get("callback"):
+                            cb(mid, False, "timeout final")
 
-                        # Limpar estado de envio se for uma transferência de arquivo
-                        with sends_lock:
-                            if msg_id in ongoing_sends:
-                                print(f"[Transferência {msg_id}] Falha no envio de arquivo devido a timeout.")
-                                del ongoing_sends[msg_id]
-                                # TODO: Idealmente, limpar ACKs pendentes de CHUNKs associados
+        for payload, target, mid, n in to_retry:
+            print(f"\n[Retry] {mid} tent.{n}/{MAX_RETRIES} → {target}")
+            send_udp(sock_param, payload, target)
 
-        # Realizar retransmissões fora do lock
-        for msg_bytes, target_addr, msg_id_retry, retry_count in acks_to_retry:
-             print(f"\n[Retransmissão] Retransmitindo mensagem {msg_id_retry} (tentativa {retry_count+1}/{MAX_RETRIES+1}) para {target_addr}")
-             send_udp_message(sock, msg_bytes, target_addr) # Não precisa de ACK aqui, já está sendo rastreado
-
-        # Remover ACKs que falharam permanentemente
-        if acks_to_remove:
+        for mid in to_drop:
             with acks_lock:
-                for msg_id in acks_to_remove:
-                    if msg_id in pending_acks: # Verifica se não foi removido por um NACK enquanto isso
-                       del pending_acks[msg_id]
+                pending_acks.pop(mid, None)
+            with sends_lock:
+                if mid in ongoing_sends:
+                    print(f"\n[Info] Transferência {mid} cancelada (timeout)")
+                    ongoing_sends.pop(mid, None)
+        purge_inactive_devices(now)
+        shutdown_flag.wait(1.0)
 
-        # 2. Verificar dispositivos inativos
-        check_inactive_devices_internal(now)
 
-        # Esperar um pouco antes da próxima verificação
-        shutdown_flag.wait(1.0) # Verificar a cada segundo
-
-def check_inactive_devices_internal(current_time):
-    """Lógica interna para remover dispositivos inativos (chamada com ou sem lock)."""
-    inactive_threshold = current_time - DEVICE_TIMEOUT
-    devices_to_remove = []
-    # Precisa do lock aqui, pois pode ser chamada por handle_heartbeat ou check_timeouts
+def purge_inactive_devices(ts: float) -> None:
+    dead: list[str] = []
     with devices_lock:
         for name, info in active_devices.items():
-            if info['last_heartbeat'] < inactive_threshold:
-                devices_to_remove.append(name)
+            if ts - info["last"] > DEVICE_TIMEOUT:
+                dead.append(name)
+        for name in dead:
+            active_devices.pop(name, None)
+            print(f"\n[Info] dispositivo '{name}' removido (timeout)")
 
-        for name in devices_to_remove:
-            del active_devices[name]
-            print(f"\n[Sistema] Dispositivo '{name}' removido por inatividade.")
 
-# --- Lógica do "Cliente" (Comandos do Usuário) ---
+def talk_callback(msg_id: str, ok: bool, error: Optional[str]) -> None:
+    if ok:
+        print(f"\n[Info] mensagem {msg_id} entregue")
+    else:
+        print(f"\n[Erro] mensagem {msg_id} falhou: {error}")
 
-def handle_user_commands(sock):
-    """Thread para processar comandos do usuário na CLI."""
-    print("\n--- Interface de Comandos ---")
-    print("Comandos disponíveis:")
-    print("  devices                      - Lista dispositivos ativos")
-    print("  talk <nome> <mensagem>     - Envia mensagem de texto")
-    print("  sendfile <nome> <arquivo>  - Envia um arquivo")
-    print("  quit                         - Encerra o dispositivo")
-    print("-----------------------------")
 
+def send_talk(sock_param: socket.socket, target: str, text: str) -> None:
+    addr = get_device_addr(target)
+    if not addr:
+        print(f"[Erro] '{target}' não encontrado")
+        return
+    mid = str(uuid.uuid4())
+    send_udp(
+        sock_param,
+        create_message("TALK", mid, text),
+        addr,
+        needs_ack=True,
+        msg_id=mid,
+        cb=talk_callback,
+    )
+
+
+def send_file(
+    sock_param: socket.socket, target: str, path_str: str | os.PathLike[str]
+) -> None:
+    addr = get_device_addr(target)
+    if not addr:
+        print(f"[Erro] '{target}' não encontrado")
+        return
+
+    try:
+        size = os.path.getsize(path_str)
+    except OSError as exc:
+        print(f"[Erro] ficheiro: {exc}")
+        return
+
+    hsum = file_sha256(path_str)
+    if not hsum:
+        return
+
+    filepath = Path(path_str)
+    tid = str(uuid.uuid4())
+    total_chunks = max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+
+    with sends_lock:
+        ongoing_sends[tid] = {
+            "path": filepath,
+            "addr": addr,
+            "size": size,
+            "chunks": total_chunks,
+            "next_seq": 0,
+            "hash": hsum,
+            "end_sent": False,
+        }
+
+    print(f"[Transfer {tid}] enviando '{filepath.name}' ({size} B) → {target}")
+    send_udp(
+        sock_param,
+        create_message("FILE", tid, filepath.name, size),
+        addr,
+        needs_ack=True,
+        msg_id=tid,
+        cb=file_callback,
+    )
+
+
+def file_callback(tid_or_chunkid: str, ok: bool, reason: Optional[str]) -> None:
+    base_id, sep, tail = tid_or_chunkid.rpartition("-")
+    is_chunk_ack = bool(sep and tail.isdigit())
+
+    if is_chunk_ack:
+        tid, seq_str = base_id, tail
+        seq = int(seq_str)
+        with sends_lock:
+            info = ongoing_sends.get(tid)
+            if not info:
+                return
+
+            if ok:
+                if seq == info["next_seq"] - 1:
+                    if info["next_seq"] < info["chunks"]:
+                        send_next_chunk(tid, info)
+                    elif not info["end_sent"]:
+                        send_end(tid, info)
+            else:
+                print(f"\n[Erro] CHUNK {seq} falhou ({tid}): {reason}")
+                ongoing_sends.pop(tid, None)
+        return
+
+    else:
+        tid = tid_or_chunkid
+        with sends_lock:
+            info = ongoing_sends.get(tid)
+            if not info:
+                return
+
+            if ok:
+                if info["next_seq"] == 0:
+                    print(f"\n[Transfer {tid}] destinatário pronto, enviando chunks…")
+                    send_next_chunk(tid, info)
+                else:
+                    print(f"\n[Transfer {tid}] concluída e confirmada!")
+                    ongoing_sends.pop(tid, None)
+            else:
+                print(f"\n[Erro] transferência {tid} falhou: {reason}")
+                ongoing_sends.pop(tid, None)
+
+
+def send_next_chunk(tid: str, info: OngoingSendInfo) -> None:
+    global sock
+    seq = info["next_seq"]
+
+    try:
+        with open(info["path"], "rb") as fh:
+            fh.seek(seq * CHUNK_SIZE)
+            data = fh.read(CHUNK_SIZE)
+    except OSError as e:
+        print(f"\n[Erro] Falha ao ler chunk {seq} do ficheiro {info['path']}: {e}")
+        with sends_lock:
+            ongoing_sends.pop(tid, None)
+        return
+
+    if not data:
+        print(f"\n[Aviso] Tentativa de ler chunk vazio {seq} para {tid}. Finalizando.")
+        if not info["end_sent"]:
+            send_end(tid, info)
+        return
+
+    b64 = base64.b64encode(data).decode()
+    payload = create_message("CHUNK", tid, seq, b64)
+    pct = (seq + 1) * 100 / info["chunks"]
+    print(f"\r[Transfer {tid}] chunk {seq + 1}/{info['chunks']} ({pct:.1f} %)", end="")
+    info["next_seq"] += 1
+
+    send_udp(
+        sock,
+        payload,
+        info["addr"],
+        needs_ack=True,
+        msg_id=f"{tid}-{seq}",
+        cb=file_callback,
+    )
+
+
+def send_end(tid: str, info: OngoingSendInfo) -> None:
+    global sock
+    info["end_sent"] = True
+    print(f"\n[Transfer {tid}] Todos os chunks enviados. Enviando END.")
+
+    send_udp(
+        sock,
+        create_message("END", tid, info["hash"]),
+        info["addr"],
+        needs_ack=True,
+        msg_id=tid,
+        cb=file_callback,
+    )
+
+
+def cli(sock_param: socket.socket) -> None:
+    print("\nComandos: devices | talk <peer> <msg> | sendfile <peer> <path> | quit")
     while not shutdown_flag.is_set():
         try:
             cmd_line = input(f"{DEVICE_NAME}> ").strip()
-            if not cmd_line:
-                continue
-
-            parts = cmd_line.split(' ', 2)
-            command = parts[0].lower()
-
-            if command == "quit":
-                print("[Sistema] Encerrando...")
-                shutdown_flag.set()
-                break
-            elif command == "devices":
-                display_active_devices()
-            elif command == "talk":
-                if len(parts) == 3:
-                    target_name = parts[1]
-                    message_text = parts[2]
-                    send_talk_message(sock, target_name, message_text)
-                else:
-                    print("Uso: talk <nome_dispositivo> <mensagem>")
-            elif command == "sendfile":
-                 if len(parts) == 3:
-                    target_name = parts[1]
-                    filepath = parts[2]
-                    send_file(sock, target_name, filepath)
-                 else:
-                    print("Uso: sendfile <nome_dispositivo> <caminho_arquivo_local>")
-            else:
-                print(f"Comando desconhecido: {command}")
-
-        except EOFError: # Captura Ctrl+D
-             print("\n[Sistema] EOF recebido, encerrando...")
-             shutdown_flag.set()
-             break
-        except KeyboardInterrupt: # Captura Ctrl+C
-             print("\n[Sistema] Interrupção recebida, encerrando...")
-             shutdown_flag.set()
-             break
+        except (EOFError, KeyboardInterrupt):
+            print("\nSaindo por interrupção...")
+            shutdown_flag.set()
+            break
         except Exception as e:
-             print(f"[Erro] Erro ao processar comando: {e}", file=sys.stderr)
+            print(f"\nErro no input: {e}")
+            continue
+
+        if not cmd_line:
+            continue
+        parts = cmd_line.split(" ", 2)
+        cmd = parts[0].lower()
+
+        match cmd:
+            case "quit":
+                shutdown_flag.set()
+            case "devices":
+                show_devices()
+            case "talk" if len(parts) == 3:
+                send_talk(sock_param, parts[1], parts[2])
+            case "sendfile" if len(parts) == 3:
+                send_file(sock_param, parts[1], parts[2])
+            case _:
+                print(f"Comando inválido ou argumentos incorretos: '{cmd_line}'")
+                print(
+                    "Uso: devices | talk <peer> <msg> | sendfile <peer> <path> | quit"
+                )
 
 
-def display_active_devices():
-    """Exibe a lista de dispositivos ativos."""
+def show_devices() -> None:
     with devices_lock:
         if not active_devices:
-            print("[Sistema] Nenhum outro dispositivo ativo detectado.")
+            print("(nenhum dispositivo)")
             return
-        print("\n--- Dispositivos Ativos ---")
         now = time.time()
+        print("Dispositivos ativos:")
         for name, info in active_devices.items():
-            last_seen = now - info['last_heartbeat']
-            print(f"  - Nome: {name}")
-            print(f"    IP: {info['ip']}, Porta: {info['port']}")
-            print(f"    Último contato: {last_seen:.1f} segundos atrás")
-        print("---------------------------")
-
-def talk_callback(msg_id, success, error_reason):
-    """Callback para mensagens TALK."""
-    if success:
-        print(f"\n[Sistema] Mensagem {msg_id} entregue com sucesso.")
-    else:
-        print(f"\n[Erro] Falha ao entregar mensagem {msg_id}: {error_reason}", file=sys.stderr)
-
-def send_talk_message(sock, target_name, message_text):
-    """Envia uma mensagem TALK para um dispositivo específico."""
-    target_addr = get_device_addr(target_name)
-    if not target_addr:
-        print(f"[Erro] Dispositivo '{target_name}' não encontrado ou inativo.", file=sys.stderr)
-        return
-
-    msg_id = str(uuid.uuid4())
-    message = create_message("TALK", msg_id, message_text)
-
-    print(f"[Sistema] Enviando mensagem para {target_name}...")
-    send_udp_message(sock, message, target_addr, needs_ack=True, msg_id=msg_id, callback=talk_callback)
-
-# --- Lógica de Envio de Arquivo ---
-
-def send_file(sock, target_name, filepath):
-    """Inicia o processo de envio de arquivo."""
-    target_addr = get_device_addr(target_name)
-    if not target_addr:
-        print(f"[Erro] Dispositivo '{target_name}' não encontrado ou inativo.", file=sys.stderr)
-        return
-
-    if not os.path.isfile(filepath):
-        print(f"[Erro] Arquivo local não encontrado: {filepath}", file=sys.stderr)
-        return
-
-    try:
-        file_size = os.path.getsize(filepath)
-        filename = os.path.basename(filepath)
-        file_hash = calculate_file_hash(filepath)
-        if file_hash is None:
-            print(f"[Erro] Não foi possível calcular o hash do arquivo: {filepath}", file=sys.stderr)
-            return
-    except Exception as e:
-        print(f"[Erro] Falha ao obter informações do arquivo {filepath}: {e}", file=sys.stderr)
-        return
-
-    transfer_id = str(uuid.uuid4()) # ID único para toda a transferência
-    total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE if file_size > 0 else 1
-
-    # Registrar estado da transferência
-    with sends_lock:
-        ongoing_sends[transfer_id] = {
-            'target_name': target_name,
-            'target_addr': target_addr,
-            'filepath': filepath,
-            'file_size': file_size,
-            'total_chunks': total_chunks,
-            'next_seq': 0,
-            'file_hash': file_hash,
-            'ack_received': threading.Event() # Evento para sinalizar ACK do FILE/END/NACK
-        }
-
-    # Criar e enviar mensagem FILE
-    file_message = create_message("FILE", transfer_id, filename, str(file_size))
-    print(f"[Transferência {transfer_id}] Iniciando envio de '{filename}' ({file_size} bytes) para {target_name}...")
-    send_udp_message(sock, file_message, target_addr, needs_ack=True, msg_id=transfer_id, callback=file_transfer_callback)
-
-    # A continuação (envio de CHUNKs) acontecerá no callback se o ACK do FILE for recebido.
-
-def file_transfer_callback(msg_id, success, reason):
-    """Callback para ACKs/NACKs/Timeouts de mensagens FILE, END e CHUNKs."""
-    # Determinar se é um ACK/NACK para FILE, END ou CHUNK
-    is_chunk_ack = '-' in msg_id # IDs de ACK de chunk são "transfer_id-seq"
-
-    if is_chunk_ack:
-        # Callback para ACK de CHUNK
-        transfer_id, seq_str = msg_id.split('-', 1)
-        try:
-             seq = int(seq_str)
-        except ValueError:
-             print(f"[Erro] ID de ACK de CHUNK inválido: {msg_id}", file=sys.stderr)
-             return
-
-        with sends_lock:
-             transfer_info = ongoing_sends.get(transfer_id)
-             if not transfer_info:
-                 # Transferência pode ter sido cancelada/concluída
-                 # print(f"DEBUG: ACK de CHUNK {seq} para transferência {transfer_id} não encontrada.")
-                 return
-
-             if success:
-                 # print(f"DEBUG: ACK recebido para CHUNK {seq} da transferência {transfer_id}")
-                 # Verificar se este ACK permite enviar o próximo chunk
-                 # A lógica de enviar o próximo chunk é melhor gerenciada após o envio inicial do FILE
-                 # e continuada aqui.
-                 if seq == transfer_info['next_seq'] - 1: # Confirmação do último enviado
-                     # Se ainda há chunks a enviar, envia o próximo
-                     if transfer_info['next_seq'] < transfer_info['total_chunks']:
-                          send_next_chunk(transfer_id, transfer_info)
-                     else:
-                          # Todos os chunks enviados e último ACK recebido, enviar END
-                          if not transfer_info.get('end_sent', False): # Evitar enviar END múltiplas vezes
-                              send_end_message(transfer_id, transfer_info)
-                 # else: ACK de chunk antigo ou fora de ordem, ignorar para controle de fluxo
-             else:
-                 # Falha ao receber ACK do CHUNK (timeout ou NACK implícito)
-                 print(f"\n[Erro] Falha ao confirmar CHUNK {seq} para transferência {transfer_id}: {reason}", file=sys.stderr)
-                 # Abortar a transferência? Ou confiar na retransmissão geral?
-                 # Por segurança, vamos abortar aqui se um chunk falhar permanentemente
-                 print(f"[Transferência {transfer_id}] Abortando envio devido à falha no CHUNK {seq}.")
-                 if transfer_id in ongoing_sends:
-                      del ongoing_sends[transfer_id]
-                 # Limpar ACKs pendentes relacionados é complexo, a thread de timeout eventualmente fará isso.
-
-    else: # Callback para FILE ou END (msg_id == transfer_id)
-        transfer_id = msg_id
-        with sends_lock:
-            transfer_info = ongoing_sends.get(transfer_id)
-            if not transfer_info:
-                 # print(f"DEBUG: Callback para transferência {transfer_id} não encontrada (FILE/END).")
-                 return # Transferência já concluída ou abortada
-
-            if success:
-                 # Determinar se foi ACK para FILE ou END
-                 # Se next_seq == 0, foi ACK para FILE, iniciar envio de chunks
-                 if transfer_info['next_seq'] == 0:
-                     print(f"[Transferência {transfer_id}] Destinatário aceitou o arquivo. Iniciando envio dos blocos...")
-                     send_next_chunk(transfer_id, transfer_info) # Envia o primeiro chunk
-                 else:
-                     # Foi ACK para END
-                     print(f"\n[Transferência {transfer_id}] Arquivo '{os.path.basename(transfer_info['filepath'])}' enviado e confirmado com sucesso por {transfer_info['target_name']}!")
-                     # Limpar estado da transferência
-                     if transfer_id in ongoing_sends:
-                          del ongoing_sends[transfer_id]
-
-            else: # Falha no FILE ou END (NACK ou Timeout)
-                 print(f"\n[Erro] Falha na transferência {transfer_id}: {reason}", file=sys.stderr)
-                 # Limpar estado da transferência
-                 if transfer_id in ongoing_sends:
-                      del ongoing_sends[transfer_id]
-                 # Limpar ACKs pendentes relacionados (se houver)
+            print(
+                f"• {name} — {info['ip']}:{info['port']} | "
+                f"visto há {now - info['last']:.1f}s",
+            )
 
 
-def send_next_chunk(transfer_id, transfer_info):
-    """Lê e envia o próximo chunk do arquivo."""
-    global sock # Precisa do socket global aqui
+def main() -> None:
+    global sock, DEVICE_NAME
 
-    seq = transfer_info['next_seq']
-    filepath = transfer_info['filepath']
-    target_addr = transfer_info['target_addr']
-
-    try:
-        with open(filepath, 'rb') as f:
-            f.seek(seq * CHUNK_SIZE)
-            chunk_data = f.read(CHUNK_SIZE)
-
-        if not chunk_data and seq < transfer_info['total_chunks']:
-            # Isso não deveria acontecer se o tamanho foi calculado corretamente
-            print(f"[Erro] Falha ao ler chunk {seq} do arquivo {filepath}, embora esperado.", file=sys.stderr)
-            # Abortar?
-            with sends_lock:
-                if transfer_id in ongoing_sends: del ongoing_sends[transfer_id]
-            return
-
-        if chunk_data:
-            chunk_b64 = base64.b64encode(chunk_data).decode('utf-8')
-            chunk_msg_id = f"{transfer_id}-{seq}" # ID único para o ACK deste chunk
-            chunk_message = create_message("CHUNK", transfer_id, str(seq), chunk_b64)
-
-            # Exibir progresso
-            progress = ((seq + 1) / transfer_info['total_chunks']) * 100
-            print(f"\r[Transferência {transfer_id}] Enviando chunk {seq+1}/{transfer_info['total_chunks']} ({progress:.1f}%)", end="")
-
-            transfer_info['next_seq'] += 1 # Incrementa antes de enviar para evitar race condition no callback
-
-            # Enviar CHUNK e esperar ACK específico para ele
-            send_udp_message(sock, chunk_message, target_addr, needs_ack=True, msg_id=chunk_msg_id, callback=file_transfer_callback)
-
-        # Se este era o último chunk a ser lido/enviado, a lógica de enviar END
-        # será acionada no callback quando o ACK deste último chunk chegar.
-        # OU se o arquivo for 0 bytes, enviar END imediatamente após ACK do FILE.
-        elif seq == 0 and transfer_info['total_chunks'] <= 1: # Caso de arquivo 0 bytes ou erro
-             if not transfer_info.get('end_sent', False):
-                  send_end_message(transfer_id, transfer_info)
-
-
-    except Exception as e:
-        print(f"\n[Erro] Falha ao ler/enviar chunk {seq} do arquivo {filepath}: {e}", file=sys.stderr)
-        # Abortar transferência
-        with sends_lock:
-             if transfer_id in ongoing_sends: del ongoing_sends[transfer_id]
-
-def send_end_message(transfer_id, transfer_info):
-    """Envia a mensagem END para finalizar a transferência."""
-    global sock # Precisa do socket global aqui
-
-    target_addr = transfer_info['target_addr']
-    file_hash = transfer_info['file_hash']
-    end_message = create_message("END", transfer_id, file_hash)
-
-    print(f"\n[Transferência {transfer_id}] Todos os chunks enviados. Enviando mensagem END.")
-    transfer_info['end_sent'] = True # Marcar que END foi enviado
-    send_udp_message(sock, end_message, target_addr, needs_ack=True, msg_id=transfer_id, callback=file_transfer_callback)
-
-
-# --- Função Principal e Inicialização ---
-
-# Variável global para o socket principal
-sock = None
-
-def main():
-    global sock
-    global DEVICE_NAME
-
-    # Permitir definir nome e porta via argumentos (opcional)
     port = DEFAULT_PORT
     if len(sys.argv) > 1:
         try:
             port = int(sys.argv[1])
+            if not (1024 <= port <= 65535):
+                raise ValueError("Porta fora do intervalo válido (1024-65535)")
             if len(sys.argv) > 2:
                 DEVICE_NAME = sys.argv[2]
-        except ValueError:
-            print(f"Aviso: Porta inválida '{sys.argv[1]}'. Usando porta padrão {DEFAULT_PORT}.")
-        except IndexError:
-            pass # Apenas porta fornecida
+        except ValueError as e:
+            print(f"Argumento inválido: {e}. Usando porta padrão {DEFAULT_PORT}.")
+            port = DEFAULT_PORT
 
-    # Configurar socket UDP
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Permitir reutilizar endereço rapidamente
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1) # Permitir envio de broadcast
-        sock.bind(('0.0.0.0', port)) # Escutar em todas as interfaces
-        # sock.settimeout(1.0) # Definir timeout para recvfrom não bloquear indefinidamente - substituido por select
-    except socket.error as e:
-        print(f"[Erro Fatal] Falha ao criar ou vincular socket na porta {port}: {e}", file=sys.stderr)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("0.0.0.0", port))
+    except OSError as e:
+        print(f"Erro ao iniciar o socket na porta {port}: {e}", file=sys.stderr)
+        print("Verifique se a porta já está em uso ou se há permissões.")
         sys.exit(1)
-    except Exception as e:
-         print(f"[Erro Fatal] Erro inesperado na configuração do socket: {e}", file=sys.stderr)
-         sys.exit(1)
 
-    print(f"--- Dispositivo '{DEVICE_NAME}' iniciado na porta {port} ---")
+    print(f"--- {DEVICE_NAME} iniciado na porta {port} ---")
 
-    # Importar select aqui, pois só é usado na thread de escuta
-    global select
-    import select
+    threads = [
+        threading.Thread(target=listener, args=(sock,), daemon=True),
+        threading.Thread(target=heartbeat_sender, args=(sock,), daemon=True),
+        threading.Thread(target=retry_manager, args=(sock,), daemon=True),
+        threading.Thread(target=cli, args=(sock,), daemon=True),
+    ]
 
-    # Criar e iniciar threads
-    threads = []
+    for t in threads:
+        t.start()
+
+    send_udp(sock, create_message("HEARTBEAT", DEVICE_NAME), (BROADCAST_ADDR, port))
+
     try:
-        listener_thread = threading.Thread(target=handle_incoming_messages, args=(sock,), name="ListenerThread")
-        heartbeat_thread = threading.Thread(target=send_heartbeat, args=(sock,), name="HeartbeatThread")
-        timeout_thread = threading.Thread(target=check_timeouts, args=(sock,), name="TimeoutThread")
-        cli_thread = threading.Thread(target=handle_user_commands, args=(sock,), name="CLIThread")
-
-        threads = [listener_thread, heartbeat_thread, timeout_thread, cli_thread]
-
-        for t in threads:
-            t.start()
-
-        # Enviar um HEARTBEAT inicial imediatamente após iniciar
-        initial_heartbeat = create_message("HEARTBEAT", DEVICE_NAME)
-        send_udp_message(sock, initial_heartbeat, (BROADCAST_ADDR, port))
-
-        # Manter a thread principal viva esperando pelas outras (ou pelo shutdown)
-        # cli_thread.join() # Espera a CLI terminar (com quit, Ctrl+C ou Ctrl+D)
-
-        # Alternativamente, esperar pelo evento de shutdown'
-        shutdown_flag.wait()
-
-
-    except Exception as e:
-         print(f"[Erro Fatal] Falha ao iniciar threads: {e}", file=sys.stderr)
-         shutdown_flag.set() # Tenta sinalizar shutdown para outras threads se alguma iniciou
+        while not shutdown_flag.wait(0.5):
+            pass
+    except KeyboardInterrupt:
+        print("\nEncerrando por KeyboardInterrupt...")
+        shutdown_flag.set()
     finally:
-        print("[Sistema] Iniciando processo de encerramento...")
-        shutdown_flag.set() # Garantir que a flag está setada
-
-        # Esperar as threads terminarem
-        for t in threads:
-             if t.is_alive():
-                 try:
-                    #print(f"DEBUG: Esperando thread {t.name} terminar...")
-                    t.join(timeout=2.0) # Espera um pouco por cada thread
-                    if t.is_alive():
-                         print(f"[Aviso] Thread {t.name} não encerrou a tempo.")
-                 except Exception as e:
-                     print(f"[Erro] Erro ao esperar thread {t.name}: {e}")
-
-
-        # Fechar o socket
-        if sock:
-            print("[Sistema] Fechando socket.")
+        print("Encerrando threads e limpando...")
+        if "sock" in globals() and sock:
             sock.close()
 
-        # Limpar arquivos parciais restantes (se houver)
         with receives_lock:
-            for transfer_id, info in ongoing_receives.items():
-                 try:
-                     print(f"[Sistema] Limpando arquivo parcial da transferência {transfer_id}...")
-                     info['file_handle'].close()
-                     os.remove(info['file_handle'].name)
-                 except Exception as e:
-                      print(f"[Erro] Falha ao limpar arquivo parcial {info.get('filename', '')}.part: {e}", file=sys.stderr)
+            if ongoing_receives:
+                print("Limpando transferências parciais...")
+                for tid, info in list(ongoing_receives.items()):
+                    try:
+                        if not info["fh"].closed:
+                            info["fh"].close()
+                        partial_file = Path(info["filename"] + ".part")
+                        partial_file.unlink(missing_ok=True)
+                        print(f" - Removido {partial_file.name} (ID: {tid})")
+                    except Exception as e:
+                        print(f"Erro ao limpar {tid}: {e}")
+        print("Programa finalizado.")
 
-        print(f"[Sistema] Dispositivo '{DEVICE_NAME}' encerrado.")
 
 if __name__ == "__main__":
     main()
