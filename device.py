@@ -27,8 +27,8 @@ DEFAULT_PORT = 55_555
 BROADCAST_ADDR = "255.255.255.255"
 HEARTBEAT_INTERVAL = 5  # seconds
 DEVICE_TIMEOUT = 3 * HEARTBEAT_INTERVAL
-ACK_TIMEOUT = 5  # seconds before retrying a message
-MAX_RETRIES = 3  # retransmissions before giving up
+ACK_TIMEOUT = 10  # seconds before retrying a message
+MAX_RETRIES = 10  # retransmissions before giving up
 CHUNK_SIZE = 512  # raw bytes per file chunk (before base64)
 MAX_UDP_PAYLOAD = 65_507  # theoretical limit for IPv4
 DEVICE_NAME = socket.gethostname()
@@ -287,14 +287,30 @@ def handle_chunk(
         info = ongoing_receives.get(transfer_id)
         if not info or info["sender"] != sender:
             return
-        send_udp(sock_param, create_message("ACK", f"{transfer_id}-{seq}"), sender)
-        if seq < info["next_seq"] or seq in info["chunks"]:
+
+        if seq < info["next_seq"]:
+            print(f"[Aviso] Chunk {seq} duplicado ou fora de ordem (esperava {info['next_seq']}) de {sender[0]}")
+            send_udp(sock_param, create_message("NACK", f"{transfer_id}-{seq}", f"Esperava chunk {info['next_seq']}"), sender)
+            return
+
+        if seq > info["next_seq"] and seq not in info["chunks"]:
+            print(f"[Aviso] Chunk {seq} chegou fora de ordem (esperava {info['next_seq']}) de {sender[0]}")
+            send_udp(sock_param, create_message("NACK", f"{transfer_id}-{seq}", f"Esperava chunk {info['next_seq']}"), sender)
+            return
+
+        if seq in info["chunks"]:
+            print(f"[Aviso] Chunk {seq} já recebido de {sender[0]}")
+            send_udp(sock_param, create_message("ACK", f"{transfer_id}-{seq}"), sender)
             return
 
         try:
             data = base64.b64decode(b64)
         except base64.binascii.Error:
+            print(f"[Aviso] Erro de decodificação base64 no chunk {seq} de {sender[0]}")
+            send_udp(sock_param, create_message("NACK", f"{transfer_id}-{seq}", "Erro de decodificação"), sender)
             return
+
+        send_udp(sock_param, create_message("ACK", f"{transfer_id}-{seq}"), sender)
 
         if seq == info["next_seq"]:
             info["fh"].write(data)
